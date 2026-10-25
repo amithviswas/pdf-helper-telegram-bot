@@ -12,9 +12,11 @@ from pathlib import Path
 
 from PIL import Image
 from pypdf import PdfWriter
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import io
+from urllib.parse import quote
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import (Application, CommandHandler, MessageHandler,
-                          CallbackQueryHandler, ContextTypes, filters)
+                          CallbackQueryHandler, PreCheckoutQueryHandler, ContextTypes, filters)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pdfbot")
@@ -22,12 +24,21 @@ log = logging.getLogger("pdfbot")
 MAX_FILES = 30
 MAX_MB = 20  # Telegram bots can download files up to 20 MB
 
+BOT_LINK = "https://t.me/PDFHelperIndiaBot"
+SHARE_URL = "https://t.me/share/url?url=" + quote(BOT_LINK) + "&text=" + quote(
+    "Free bot that turns photos into PDF, merges PDFs and shrinks photos/PDFs for exam & job forms. No app, no watermark 👇")
+
 WELCOME = (
-    "Hi! I'm your free PDF helper.\n\n"
-    "📷 Send me photos (notes, documents, certificates) and I'll turn them into one PDF.\n"
-    "📎 Send me PDF files and I can merge them into one, or shrink a big PDF so it fits upload limits.\n\n"
-    "Just send your files, then tap a button. /clear starts over."
+    "Hi! I'm your free PDF helper. No app, no signup, no watermark.\n\n"
+    "📷 Photos → one PDF (notes, documents, certificates)\n"
+    "🔗 Merge many PDFs into one\n"
+    "🗜 Shrink a big PDF to fit upload limits\n"
+    "🪪 Shrink a photo or signature to under 20/50/100 KB for exam & job forms\n\n"
+    "Just send your files, then tap a button. /clear starts over.\n"
+    "Like it? /support keeps it free ⭐"
 )
+
+SHARE_KB = InlineKeyboardMarkup([[InlineKeyboardButton("📤 Share with friends", url=SHARE_URL)]])
 
 
 def session(ctx: ContextTypes.DEFAULT_TYPE) -> dict:
@@ -49,6 +60,10 @@ def buttons(s: dict) -> InlineKeyboardMarkup:
     rows = []
     if s["images"]:
         rows.append([InlineKeyboardButton(f"📄 Make PDF ({len(s['images'])} photos)", callback_data="make")])
+    if len(s["images"]) == 1:
+        rows.append([InlineKeyboardButton("🪪 Under 20 KB", callback_data="kb20"),
+                     InlineKeyboardButton("50 KB", callback_data="kb50"),
+                     InlineKeyboardButton("100 KB", callback_data="kb100")])
     if len(s["pdfs"]) >= 2:
         rows.append([InlineKeyboardButton(f"🔗 Merge {len(s['pdfs'])} PDFs", callback_data="merge")])
     if len(s["pdfs"]) == 1:
@@ -124,6 +139,24 @@ def compress_pdf(src, out):
                    check=True, timeout=120)
 
 
+def shrink_photo(src, out, max_kb):
+    im = Image.open(src).convert("RGB")
+    limit = max_kb * 1024
+    w, h = im.size
+    scale = 1.0
+    while True:
+        cur = im if scale == 1.0 else im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        for q in (90, 80, 70, 60, 50, 40, 30, 20):
+            buf = io.BytesIO()
+            cur.save(buf, "JPEG", quality=q, optimize=True)
+            if buf.tell() <= limit:
+                Path(out).write_bytes(buf.getvalue())
+                return cur.size, buf.tell()
+        scale *= 0.8
+        if scale < 0.05:
+            raise ValueError("cannot shrink")
+
+
 def mb(path):
     return os.path.getsize(path) / 1024 / 1024
 
@@ -144,6 +177,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             images_to_pdf(s["images"], out)
             await q.message.reply_document(open(out, "rb"), filename="photos.pdf",
                                            caption="Here's your PDF ✅")
+        elif action in ("kb20", "kb50", "kb100") and s["images"]:
+            kb = int(action[2:])
+            photo_out = Path(s["dir"]) / "photo.jpg"
+            (pw, ph), size = shrink_photo(s["images"][-1], photo_out, kb)
+            await q.message.reply_document(open(photo_out, "rb"), filename=f"photo_{kb}kb.jpg",
+                                           caption=f"Done ✅ {size // 1024} KB, {pw}×{ph} px. Ready for your form.")
         elif action == "merge" and len(s["pdfs"]) >= 2:
             await q.message.reply_text("Merging…")
             merge_pdfs(s["pdfs"], out)
@@ -167,13 +206,67 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Sorry, something went wrong with that file. Try another one.")
         return
     reset(ctx)
-    await q.message.reply_text("Done! Send more files anytime. Share me with friends who need this 🙌")
+    await q.message.reply_text("Done! Send more files anytime. Know someone filling forms or sending notes? Share me 🙌",
+                               reply_markup=SHARE_KB)
+
+
+TIPS = {"tip25": 25, "tip50": 50, "tip100": 100}
+
+
+async def support(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ 25", callback_data="tip25"), InlineKeyboardButton("⭐ 50", callback_data="tip50"),
+         InlineKeyboardButton("⭐ 100", callback_data="tip100")],
+        [InlineKeyboardButton("📤 Share with friends (free!)", url=SHARE_URL)]])
+    await update.message.reply_text(
+        "This bot is free for everyone. If it saved you time, you can tip with Telegram Stars, "
+        "or just share it with friends. Thank you! 🙏", reply_markup=kb)
+
+
+async def on_tip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    stars = TIPS[q.data]
+    await ctx.bot.send_invoice(chat_id=q.message.chat_id, title="Support PDF Helper",
+                               description="A thank-you tip to keep PDF Helper free.",
+                               payload=f"tip-{stars}", provider_token="", currency="XTR",
+                               prices=[LabeledPrice("Tip", stars)])
+
+
+async def precheckout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.pre_checkout_query.answer(ok=True)
+
+
+async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    p = update.message.successful_payment
+    log.info("TIP %s stars from %s", p.total_amount, update.effective_user.id)
+    await update.message.reply_text("Thank you so much for the support! ⭐🙏")
+
+
+async def paysupport(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Tips are voluntary thank-yous. If you paid by mistake, reply here with the date and amount "
+        "and it will be refunded.")
+
+
+async def stats_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    users = ctx.bot_data.setdefault("users", set())
+    if update.effective_user and update.effective_user.id not in users:
+        users.add(update.effective_user.id)
+        log.info("NEW_USER total_since_restart=%d", len(users))
 
 
 def main():
     token = os.environ["BOT_TOKEN"]
     app = Application.builder().token(token).build()
+    from telegram.ext import TypeHandler
+    app.add_handler(TypeHandler(Update, stats_log), group=-1)
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("support", support))
+    app.add_handler(CommandHandler("paysupport", paysupport))
+    app.add_handler(CallbackQueryHandler(on_tip, pattern="^tip"))
+    app.add_handler(PreCheckoutQueryHandler(precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, paid))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
