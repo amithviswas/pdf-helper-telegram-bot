@@ -84,7 +84,11 @@ class PgStore:
 
     async def init(self):
         import asyncpg
-        self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=4)
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+        u = urlsplit(self.dsn)
+        qs = [(k, v) for k, v in parse_qsl(u.query) if k != "channel_binding"]
+        dsn = urlunsplit(u._replace(query=urlencode(qs)))
+        self.pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
         async with self.pool.acquire() as c:
             await c.execute("""
             CREATE TABLE IF NOT EXISTS users(
