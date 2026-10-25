@@ -138,14 +138,19 @@ def results_kb(items, default_kind=None):
 
 def providers_text(wp):
     ind = (wp or {}).get("results", {}).get(REGION, {})
-    lines = []
+    lines, seen = [], set()
     for key, label in (("flatrate", "▶️ Streaming on"), ("free", "🆓 Free on"), ("ads", "🆓 Free with ads on"),
                        ("rent", "💳 Rent on"), ("buy", "🛒 Buy on")):
-        names = [p["provider_name"] for p in ind.get(key, [])][:5]
+        if key in ("rent", "buy") and lines:
+            break  # streamable: skip rent/buy noise
+        names = []
+        for pr in ind.get(key, []):
+            n = pr["provider_name"].replace(" with Ads", "").replace(" Amazon Channel", "")
+            if n not in seen:
+                seen.add(n)
+                names.append(n)
         if names:
-            lines.append(f"{label}: <b>{html.escape(', '.join(names))}</b>")
-        if key == "ads" and lines:
-            break  # if it's streamable, skip rent/buy noise
+            lines.append(f"{label}: <b>{html.escape(', '.join(names[:5]))}</b>")
     return "\n".join(lines) if lines else "❌ Not on any Indian OTT app right now (maybe only in theatres)."
 
 
