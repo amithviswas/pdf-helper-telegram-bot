@@ -32,6 +32,7 @@ LANGS = {"all": "All", "hi": "Hindi", "te": "Telugu", "ta": "Tamil", "ml": "Mala
          "kn": "Kannada", "en": "English", "ko": "Korean"}
 
 http: httpx.AsyncClient = None
+ia_http = httpx.AsyncClient(timeout=15)
 GENRES = {}
 
 
@@ -204,6 +205,50 @@ async def send_details(chat_msg, kind, tid):
                                   disable_web_page_preview=True)
 
 
+# ---------------- free legal full movies (Internet Archive) ----------------
+IA_SAFE = "(year:[1800 TO 1930] OR licenseurl:*publicdomain* OR licenseurl:*creativecommons*)"
+
+
+async def ia_search(q=None, rows=6):
+    query = f"collection:(feature_films) AND mediatype:(movies) AND {IA_SAFE}"
+    if q:
+        q = "".join(c for c in q if c.isalnum() or c == " ").strip()
+        if not q:
+            return []
+        query = f"title:({q}) AND " + query
+    params = {"q": query, "fl[]": ["identifier", "title", "year"], "sort[]": "downloads desc",
+              "rows": rows, "output": "json"}
+    try:
+        r = await ia_http.get("https://archive.org/advancedsearch.php", params=params)
+        return r.json().get("response", {}).get("docs", [])
+    except Exception as e:
+        log.warning("ia: %s", e)
+        return []
+
+
+def ia_kb(docs):
+    rows = []
+    for d in docs:
+        t = d.get("title") or d["identifier"]
+        if isinstance(t, list):
+            t = t[0]
+        y = d.get("year")
+        rows.append([InlineKeyboardButton(f"⬇️ {t[:45]}{f' ({y})' if y else ''}",
+                                          url=f"https://archive.org/details/{d['identifier']}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def free_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = " ".join(ctx.args) if ctx.args else None
+    docs = await ia_search(q, rows=10)
+    if not docs:
+        await update.message.reply_text("No free legal copy found for that. Try /free with no name to see popular classics.")
+        return
+    await update.message.reply_text(
+        "🆓 Free full movies — legal to watch & download (public domain / Creative Commons, via Internet Archive).\n"
+        "Tap one, then pick MPEG4 under Download Options:", reply_markup=ia_kb(docs))
+
+
 # ---------------- handlers ----------------
 WELCOME = ("🍿 <b>Movie & Series Finder</b>\n\n"
            "Just type any movie or web series name, like <i>Pushpa 2</i> or <i>Panchayat</i>.\n"
@@ -212,6 +257,7 @@ WELCOME = ("🍿 <b>Movie & Series Finder</b>\n\n"
            "/new — new on OTT this month (Telugu, Hindi, Tamil…)\n"
            "/trending — what everyone's watching this week\n"
            "/watchlist — your saved titles\n"
+           "/free — free full movies you can legally download\n"
            "/support — tip with Stars")
 
 
@@ -226,7 +272,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME, parse_mode=ParseMode.HTML, reply_markup=share_kb(ctx))
 
 
-async def on_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def search_tmdb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.message.text.strip()[:80]
     data = await tmdb("/search/multi", query=q, language="en-IN", region=REGION, include_adult="false")
     items = [i for i in data.get("results", []) if i.get("media_type") in ("movie", "tv")]
@@ -241,6 +287,13 @@ async def on_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Not this one? Pick another:", reply_markup=results_kb(items[1:]))
         return
     await update.message.reply_text(f"🔎 Results for “{q}”:", reply_markup=results_kb(items))
+
+
+async def on_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await search_tmdb(update, ctx)
+    docs = await ia_search(update.message.text.strip()[:80], rows=3)
+    if docs:
+        await update.message.reply_text("🆓 Free full movie available (legal, public domain):", reply_markup=ia_kb(docs))
 
 
 def lang_kb(prefix):
@@ -393,6 +446,7 @@ async def post_init(app):
             BotCommand("new", "New on OTT (Telugu, Hindi, Tamil…)"),
             BotCommand("trending", "Trending this week"),
             BotCommand("watchlist", "Your saved titles"),
+            BotCommand("free", "Free full movies (legal downloads)"),
             BotCommand("support", "Tip with Telegram Stars"),
             BotCommand("paysupport", "Help with a payment"),
         ])
@@ -419,6 +473,7 @@ def main():
     app.add_handler(CommandHandler("new", new_cmd, filters=pv))
     app.add_handler(CommandHandler("trending", trending, filters=pv))
     app.add_handler(CommandHandler("watchlist", watchlist, filters=pv))
+    app.add_handler(CommandHandler("free", free_cmd, filters=pv))
     app.add_handler(CommandHandler("support", support, filters=pv))
     app.add_handler(CommandHandler("paysupport", paysupport, filters=pv))
     app.add_handler(CommandHandler("totals", totals, filters=pv))
